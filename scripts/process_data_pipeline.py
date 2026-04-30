@@ -958,7 +958,7 @@ def process_conversion_rates(
     log: list[str],
     orders_by_channel_month: dict[tuple[str, int, int], int],
     orders_by_month: dict[tuple[int, int], int],
-) -> tuple[dict[tuple[str, int], float], dict[tuple[int, int], float]]:
+) -> tuple[dict[tuple[str, int], float], dict[tuple[int, int], float], dict[int, float]]:
     sessions_by_channel_month: dict[tuple[str, int, int], float] = {}
     sessions_by_month: dict[tuple[int, int], float] = {}
 
@@ -997,8 +997,17 @@ def process_conversion_rates(
         session_count = sessions_by_month.get(key, 0.0)
         overall_rates[key] = order_count / (session_count + 1e-8)
 
+    # FIXED: conversion rate by month only (for test period lookup)
+    conversion_by_month_only: dict[int, float] = {}
+    for month in range(1, 13):
+        month_rates = [r for (y, m), r in overall_rates.items() if m == month]
+        if month_rates:
+            conversion_by_month_only[month] = mean(month_rates)
+        else:
+            conversion_by_month_only[month] = 0.0
+
     log.append("orders + web_traffic: conversion rates computed")
-    return channel_rates, overall_rates
+    return channel_rates, overall_rates, conversion_by_month_only
 
 
 def build_feature_catalog(columns: list[str]) -> list[dict[str, object]]:
@@ -1074,11 +1083,38 @@ def main() -> None:
     traffic_profile, traffic_global_mean, traffic_global_std = process_traffic_profile(log)
     traffic_daily, expected_sessions = process_traffic_daily(log, traffic_profile, traffic_global_mean, traffic_global_std, timeline)
 
-    _, conversion_rates_by_month = process_conversion_rates(log, orders_by_channel_month, orders_by_month)
+    _, conversion_rates_by_month, conversion_by_month_only = process_conversion_rates(log, orders_by_channel_month, orders_by_month)
 
     inventory_overall = build_inventory_daily(log, timeline)
     promo_state = build_promo_state(timeline, promo_daily)
     traffic_lags = build_traffic_lags(timeline, expected_sessions)
+
+    # FIXED: compute promo seasonal probabilities from train data
+    promo_seasonal_prob: dict[tuple[int, int], float] = {}
+    promo_monthly_prob: dict[int, float] = {}
+    promo_active_train: list[int] = [promo_state[d]["promo_active"] for d in timeline if d <= CUTOFF_DATE]
+    promo_dates_train: list[date] = [d for d in timeline if d <= CUTOFF_DATE]
+
+    # By month-day
+    md_counts: dict[tuple[int, int], int] = {}
+    md_active: dict[tuple[int, int], int] = {}
+    for d in promo_dates_train:
+        md = (d.month, d.day)
+        md_counts[md] = md_counts.get(md, 0) + 1
+        if promo_state[d]["promo_active"]:
+            md_active[md] = md_active.get(md, 0) + 1
+    for md, cnt in md_counts.items():
+        promo_seasonal_prob[md] = md_active.get(md, 0) / cnt
+
+    # By month
+    month_counts: dict[int, int] = {}
+    month_active: dict[int, int] = {}
+    for d in promo_dates_train:
+        month_counts[d.month] = month_counts.get(d.month, 0) + 1
+        if promo_state[d]["promo_active"]:
+            month_active[d.month] = month_active.get(d.month, 0) + 1
+    for m, cnt in month_counts.items():
+        promo_monthly_prob[m] = month_active.get(m, 0) / cnt
 
     overall_return_rate = 0.0
     total_returned = sum(returned.values())
@@ -1124,6 +1160,7 @@ def main() -> None:
         ["Date"]
         + temporal_cols
         + promo_cols
+        + ["promo_seasonal_prob", "promo_monthly_prob"]
         + traffic_cols
         + inventory_cols
         + conversion_cols
@@ -1139,16 +1176,34 @@ def main() -> None:
         row.update(traffic_daily[d])
         row.update(inventory_overall[d])
 
-        conversion_key = (d.year, d.month)
-        conversion_rate = conversion_rates_by_month.get(conversion_key)
-        if conversion_rate is None:
-            conversion_rate = 0.0
-            imputed_flag = 1
+        # FIXED: conversion rate lookup
+        if d <= CUTOFF_DATE:
+            conversion_key = (d.year, d.month)
+            conversion_rate = conversion_rates_by_month.get(conversion_key)
+            if conversion_rate is None:
+                conversion_rate = 0.0
+                imputed_flag = 1
+            else:
+                imputed_flag = 0
         else:
-            imputed_flag = 0
+            # Use month-only average for test period
+            conversion_rate = conversion_by_month_only.get(d.month, 0.0)
+            imputed_flag = 1  # still imputed but from historical monthly average
         row["conversion_rate_overall"] = conversion_rate
         row["is_imputed_conversion_rate"] = imputed_flag
         imputed_conversion_flags.append(imputed_flag)
+
+        # FIXED: promo seasonal probabilities
+        row["promo_seasonal_prob"] = promo_seasonal_prob.get((d.month, d.day), 0.0)
+        row["promo_monthly_prob"] = promo_monthly_prob.get(d.month, 0.0)
+
+        # FIXED: inventory in test period — mark as stale/projected
+        if d > CUTOFF_DATE:
+            for inv_key in inventory_cols:
+                if inv_key == "inventory_is_stale_rate":
+                    row[inv_key] = 1.0
+                else:
+                    row[inv_key] = ""
 
         row["return_rate_overall"] = overall_return_rate
         row["promo_efficiency_overall"] = overall_promo_efficiency

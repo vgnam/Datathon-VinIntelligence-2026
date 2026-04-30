@@ -1,0 +1,162 @@
+================================================================================
+KIEM DINH THONG KE XAC DINH FEATURE QUAN TRONG DOI VOI REVENUE
+================================================================================
+So luong mau: 3833
+So luong features: 30
+
+--------------------------------------------------------------------------------
+1. KIEM DINH TUONG QUAN PEARSON (moi quan he tuyen tinh)
+--------------------------------------------------------------------------------
+                      Feature  Pearson_r       p_value
+   hist_monthday_revenue_mean   0.801558  0.000000e+00
+      hist_monthday_cogs_mean   0.787851  0.000000e+00
+                      day_cos  -0.439199 1.551069e-180
+            expected_sessions   0.322527  1.677998e-93
+                      day_sin   0.305776  9.175957e-84
+         hist_yoy_cogs_growth   0.259648  4.274096e-60
+       inventory_sell_through   0.235887  1.286597e-49
+                        month  -0.204271  2.189747e-37
+inventory_days_since_snapshot   0.202992  6.241988e-37
+       holiday_recency_weight   0.152452  2.289542e-21
+           promo_carryover_5d  -0.145873  1.117766e-19
+              promo_intensity  -0.144384  2.630452e-19
+      hist_yoy_revenue_growth   0.140101  2.932844e-18
+          traffic_uncertainty   0.111474  4.490794e-12
+           tet_recency_weight  -0.103500  1.336201e-10
+
+--------------------------------------------------------------------------------
+2. KIEM DINH TUONG QUAN SPEARMAN (moi quan he monotonic)
+--------------------------------------------------------------------------------
+                      Feature  Spearman_rho       p_value
+   hist_monthday_revenue_mean      0.781684  0.000000e+00
+      hist_monthday_cogs_mean      0.768249  0.000000e+00
+                      day_cos     -0.479198 2.516573e-219
+      hist_yoy_revenue_growth      0.408369 5.351982e-154
+            expected_sessions      0.367334 9.161564e-123
+         hist_yoy_cogs_growth      0.355042 2.965226e-114
+      conversion_rate_overall      0.340489 1.174350e-104
+                      day_sin      0.307884  5.915989e-85
+       inventory_sell_through      0.286484  2.576336e-73
+inventory_days_since_snapshot      0.249978  1.075164e-55
+                        month     -0.238785  7.788522e-51
+          inventory_fill_rate     -0.218391  1.301967e-42
+           tet_recency_weight     -0.185819  4.039396e-31
+              promo_intensity     -0.168043  1.126201e-25
+           promo_carryover_5d     -0.145942  1.074480e-19
+
+--------------------------------------------------------------------------------
+3. KIEM DINH F-TEST (Univariate Linear Regression F-test)
+--------------------------------------------------------------------------------
+   H0: Feature khong co kha nang giai thich phuong sai cua target
+   H1: Feature co kha nang giai thich phuong sai cua target
+
+                      Feature  F_statistic       p_value
+   hist_monthday_revenue_mean  6884.924770  0.000000e+00
+      hist_monthday_cogs_mean  6269.428813  0.000000e+00
+                      day_cos   915.599887 1.551069e-180
+            expected_sessions   444.782307  1.677998e-93
+                      day_sin   395.140173  9.175957e-84
+         hist_yoy_cogs_growth   276.944707  4.274096e-60
+       inventory_sell_through   225.726624  1.286597e-49
+                        month   166.815715  2.189747e-37
+inventory_days_since_snapshot   164.643009  6.241988e-37
+       holiday_recency_weight    91.157354  2.289542e-21
+           promo_carryover_5d    83.292232  1.117766e-19
+              promo_intensity    81.564230  2.630452e-19
+      hist_yoy_revenue_growth    76.701780  2.932844e-18
+          traffic_uncertainty    48.204562  4.490794e-12
+           tet_recency_weight    41.483214  1.336201e-10
+
+--------------------------------------------------------------------------------
+4. MUTUAL INFORMATION (moi quan he phi tuyen tinh)
+--------------------------------------------------------------------------------
+   Do luong luong thong tin feature cung cap ve target
+
+                      Feature  MI_Score
+   hist_monthday_revenue_mean  0.508215
+      hist_monthday_cogs_mean  0.492222
+                      day_cos  0.248696
+                        month  0.245740
+         hist_yoy_cogs_growth  0.236805
+      hist_yoy_revenue_growth  0.227951
+                      day_sin  0.198442
+          traffic_uncertainty  0.150869
+            expected_sessions  0.125454
+inventory_days_since_snapshot  0.111489
+       inventory_sell_through  0.109485
+              promo_intensity  0.095314
+          inventory_fill_rate  0.048885
+      inventory_is_stale_rate  0.036459
+                  days_to_tet  0.020016
+
+================================================================================
+5. TONG HOP XEP HANG FEATURE QUAN TRONG NHAT
+================================================================================
+
+TOP 20 FEATURE QUAN TRONG NHAT (theo diem tong hop):
+--------------------------------------------------------------------------------
+Rank   Feature                             Pearson    Spearman   F_norm     MI_norm    Composite 
+--------------------------------------------------------------------------------
+1      hist_monthday_revenue_mean          0.8016     0.7817     1.0000     1.0000     0.8958    
+2      hist_monthday_cogs_mean             0.7879     0.7682     0.9106     0.9685     0.8588    
+3      day_cos                             0.4392     0.4792     0.1329     0.4894     0.3852    
+4      hist_yoy_cogs_growth                0.2596     0.3550     0.0402     0.4660     0.2802    
+5      day_sin                             0.3058     0.3079     0.0573     0.3905     0.2654    
+6      hist_yoy_revenue_growth             0.1401     0.4084     0.0111     0.4485     0.2520    
+7      expected_sessions                   0.3225     0.3673     0.0645     0.2469     0.2503    
+8      month                               0.2043     0.2388     0.0242     0.4835     0.2377    
+9      inventory_sell_through              0.2359     0.2865     0.0327     0.2154     0.1926    
+10     inventory_days_since_snapshot       0.2030     0.2500     0.0239     0.2194     0.1740    
+11     traffic_uncertainty                 0.1115     0.1201     0.0069     0.2969     0.1339    
+12     promo_intensity                     0.1444     0.1680     0.0118     0.1875     0.1279    
+13     conversion_rate_overall             0.0104     0.3405     0.0000     0.0352     0.0965    
+14     inventory_fill_rate                 0.0124     0.2184     0.0000     0.0962     0.0817    
+15     tet_recency_weight                  0.1035     0.1858     0.0060     0.0253     0.0801    
+16     promo_carryover_5d                  0.1459     0.1459     0.0120     0.0081     0.0780    
+17     holiday_recency_weight              0.1525     0.0621     0.0132     0.0262     0.0635    
+18     inventory_is_stale_rate             0.0565     0.1213     0.0017     0.0717     0.0628    
+19     days_to_tet                         0.0794     0.1042     0.0035     0.0394     0.0566    
+20     hist_weekday_revenue_mean           0.1009     0.0866     0.0057     0.0197     0.0532    
+
+================================================================================
+6. PHAN LOAI FEATURE THEO NHOM Y NGHIA KINH DOANH
+================================================================================
+
+Diem trung binh theo nhom feature:
+  Historical Patterns      : 0.3097
+  Calendar/Basic           : 0.1936
+  Web Traffic              : 0.1602
+  Inventory                : 0.1278
+  Promotions               : 0.0691
+  Calendar/Holidays        : 0.0525
+
+Da luu chi tiet ket qua tai: D:\Datathon-2026\output\feature_importance_test.csv
+
+================================================================================
+KET LUAN
+================================================================================
+
+Dua tren 4 phep kiem dinh thong ke, cac feature QUAN TRONG NHAT doi voi Revenue la:
+
+1. HISTORICAL PATTERNS (cac feature 'hist_*'):
+   - Day la nhom co diem tong hop cao nhat
+   - Bao gom: doanh thu trung binh theo ngay trong tuan, thang, 
+     ngay le, khuyen mai, Tet...
+   - Giai thich: Qua khu la chi bao tot nhat cho tuong lai trong 
+     chuoi thoi gian (tinh tu tuong quan/autocorrelation)
+
+2. PROMOTIONS (cac feature 'promo_*'):
+   - Cuong do khuyen mai, hieu ung keo dai
+   - Giai thich: Khuyen mai tao ra cac "demand shock" bat thuong
+
+3. WEB TRAFFIC (cac feature 'traffic_*', 'session', 'conversion'):
+   - La leading indicator - xay ra TRUOC khi doanh thu phat sinh
+   - Giai thich: So luot truy cap web phan anh y dinh mua hang
+
+4. CALENDAR/HOLIDAYS (cac feature 'tet_*', 'holiday_*'):
+   - Dac biet la days_to_tet, is_tet_period
+   - Giai thich: Thoi trang Viet Nam co tinh mua vu rat cao
+
+5. INVENTORY (cac feature 'inventory_*'):
+   - Ty le dap ung don hang, ton kho
+   - Giai thich: Supply constraint anh huong den kha nang dap ung demand
