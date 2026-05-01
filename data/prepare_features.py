@@ -20,11 +20,84 @@ warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "analytical"
+OP_DIR = ROOT / "operational"
+TRANS_DIR = ROOT / "transaction"
 OUT_DIR = ROOT.parent / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SALES_FILE = RAW_DIR / "sales.csv"
 TEST_FILE = RAW_DIR / "sample_submission.csv"
+TRAFFIC_FILE = OP_DIR / "web_traffic.csv"
+ORDERS_FILE = TRANS_DIR / "orders.csv"
+ORDER_ITEMS_FILE = TRANS_DIR / "order_items.csv"
+RETURNS_FILE = TRANS_DIR / "returns.csv"
+
+
+def load_annual_metrics():
+    """Derive annual structural metrics from transaction/operational data."""
+    rows = []
+    if ORDERS_FILE.exists():
+        orders = pd.read_csv(ORDERS_FILE, parse_dates=["order_date"])
+        orders["year"] = orders["order_date"].dt.year
+
+        uniq = orders.groupby("year")["customer_id"].nunique().reset_index()
+        uniq.columns = ["year", "annual_unique_customers"]
+
+        total = orders.groupby("year").size().reset_index(name="annual_total_orders")
+
+        first_year = orders.groupby("customer_id")["year"].min().reset_index()
+        first_year.columns = ["customer_id", "first_year"]
+        orders2 = orders.merge(first_year, on="customer_id", how="left")
+        orders2["is_new"] = (orders2["year"] == orders2["first_year"]).astype(int)
+        new_rate = orders2.groupby("year")["is_new"].mean().reset_index()
+        new_rate.columns = ["year", "annual_new_customer_rate"]
+
+        aov = None
+        if ORDER_ITEMS_FILE.exists():
+            items = pd.read_csv(ORDER_ITEMS_FILE)
+            items["line_value"] = items["quantity"] * items["unit_price"]
+            items = items.merge(orders[["order_id", "year"]].drop_duplicates(), on="order_id", how="left")
+            aov = items.groupby("year").agg(total_value=("line_value", "sum"), total_discount=("discount_amount", "sum")).reset_index()
+            aov = aov.merge(total, on="year", how="left")
+            aov["annual_aov"] = aov["total_value"] / aov["annual_total_orders"]
+            aov["annual_discount_intensity"] = aov["total_discount"] / aov["total_value"]
+
+        ret = None
+        if RETURNS_FILE.exists():
+            returns = pd.read_csv(RETURNS_FILE)
+            order_year = orders[["order_id", "year"]].drop_duplicates()
+            returns = returns.merge(order_year, on="order_id", how="left")
+            returned_orders = returns.groupby("year")["order_id"].nunique().reset_index()
+            returned_orders.columns = ["year", "annual_returned_orders"]
+            ret = total.merge(returned_orders, on="year", how="left")
+            ret["annual_return_rate"] = ret["annual_returned_orders"] / ret["annual_total_orders"]
+
+        df = uniq.merge(total, on="year").merge(new_rate, on="year")
+        if aov is not None:
+            df = df.merge(aov[["year", "annual_aov", "annual_discount_intensity"]], on="year", how="left")
+        else:
+            df["annual_aov"] = np.nan
+            df["annual_discount_intensity"] = np.nan
+        if ret is not None:
+            df = df.merge(ret[["year", "annual_return_rate"]], on="year", how="left")
+        else:
+            df["annual_return_rate"] = np.nan
+        rows.append(df)
+
+    if TRAFFIC_FILE.exists():
+        traffic = pd.read_csv(TRAFFIC_FILE, parse_dates=["date"])
+        traffic["year"] = traffic["date"].dt.year
+        sess = traffic.groupby("year")["sessions"].sum().reset_index()
+        sess.columns = ["year", "annual_sessions"]
+        sess["annual_sessions_growth"] = sess["annual_sessions"].pct_change()
+        if rows:
+            rows[0] = rows[0].merge(sess, on="year", how="left")
+        else:
+            rows.append(sess)
+
+    if rows:
+        return rows[0]
+    return pd.DataFrame()
 
 
 def main():
@@ -150,7 +223,27 @@ def main():
         sales[col] = sales[col].fillna(sales["hist_monthday_revenue_mean"] if "revenue" in col else sales["hist_monthday_cogs_mean"])
 
     # ========================================================================
-    # 5. Assemble outputs
+    # 5. Annual structural metrics from operational data (extrapolated to test)
+    # ========================================================================
+    ann_metrics = load_annual_metrics()
+    if not ann_metrics.empty:
+        test_years = sorted(test_dates["year"].unique())
+        extra_rows = []
+        for y in test_years:
+            if y not in ann_metrics["year"].values:
+                row = {"year": y}
+                for col in ann_metrics.columns:
+                    if col == "year":
+                        continue
+                    row[col] = ann_metrics[col].iloc[-3:].mean()
+                extra_rows.append(row)
+        if extra_rows:
+            ann_metrics = pd.concat([ann_metrics, pd.DataFrame(extra_rows)], ignore_index=True)
+        sales = sales.merge(ann_metrics, on="year", how="left")
+        test_dates = test_dates.merge(ann_metrics, on="year", how="left")
+
+    # ========================================================================
+    # 6. Assemble outputs
     # ========================================================================
     feature_cols = [
         "Date",
@@ -180,6 +273,8 @@ def main():
         "weekday",
         "day",
     ]
+    ann_cols = [c for c in ann_metrics.columns if c != "year"] if not ann_metrics.empty else []
+    feature_cols.extend(ann_cols)
 
     train_features = sales[feature_cols].copy()
     train_features = train_features.fillna(train_features.median(numeric_only=True))
