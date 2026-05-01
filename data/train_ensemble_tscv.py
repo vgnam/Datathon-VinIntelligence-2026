@@ -642,7 +642,7 @@ def main():
         oof, test_avg, y, test_feat["Date"], X_train_raw, X_test_raw, meta_name=meta_name
     )
     out_path_res = OUT_DIR / f"stacking3_{meta_name}_resen_tscv_submission.csv"
-    sub_res.to_csv(out_path_res, index=False)
+    # sub_res.to_csv(out_path_res, index=False)
     print(f"Saved: {out_path_res}")
     print(f"Stacking3+ResEN OOF — Revenue MAPE: {mape(y['Revenue'], stack_res_rev):.4f} | R2: {r2_score_fn(y['Revenue'], stack_res_rev):.4f}")
     print(f"Stacking3+ResEN OOF — COGS   MAPE: {mape(y['COGS'], stack_res_cogs):.4f} | R2: {r2_score_fn(y['COGS'], stack_res_cogs):.4f}")
