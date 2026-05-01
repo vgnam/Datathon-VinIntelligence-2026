@@ -1,7 +1,9 @@
 """
 train_ensemble_tscv.py
-Train tree-based models + Baseline+ Residual ElasticNet with TimeSeriesCV,
-then stack by Huber Regression. Export submission CSV + diagnostic plots.
+Train tree-based models (RF, LGB, XGB) with TimeSeriesCV,
+then stack by multiple meta-learners (Huber, Ridge, Lasso, ElasticNet, BayesianRidge, GBM).
+Optional: add ResEN residual layer on top of stacking.
+Export submission CSV + diagnostic plots.
 
 Assumes working directory contains the script or is project-root,
 with processed features at ../output/ and raw data at ./analytical/.
@@ -16,8 +18,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import ElasticNet, HuberRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.linear_model import BayesianRidge, ElasticNet, HuberRegressor, Lasso, Ridge
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -34,8 +36,8 @@ RAW_DIR = ROOT / "analytical"
 OUT_DIR = ROOT / "forecast"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TRAIN_FEATURES = FEAT_DIR / "train_features_selected_v1_10.csv"
-TEST_FEATURES = FEAT_DIR / "test_features_selected_v1_10.csv"
+TRAIN_FEATURES = FEAT_DIR / "train_features.csv"
+TEST_FEATURES = FEAT_DIR / "test_features.csv"
 TRAIN_TARGET = FEAT_DIR / "train_target.csv"
 
 TRAIN_FILE = RAW_DIR / "sales.csv"
@@ -48,7 +50,6 @@ PROMO_FILE = ROOT / "master" / "promotions.csv"
 def mape(actual, pred):
     actual = np.asarray(actual, dtype=float)
     pred = np.asarray(pred, dtype=float)
-    # replace inf with nan, then drop
     mask = np.isfinite(actual) & np.isfinite(pred)
     if not mask.any():
         return np.inf
@@ -111,222 +112,11 @@ def load_processed_features():
 
 
 # ---------------------------------------------------------------------------
-# 2. Build Baseline+ predictions
-# ---------------------------------------------------------------------------
-def build_baseline_plus(train_df, test_df):
-    train = train_df.copy()
-    test = test_df.copy()
-
-    promo = pd.DataFrame()
-    if PROMO_FILE.exists():
-        promo = pd.read_csv(PROMO_FILE, parse_dates=["start_date", "end_date"])
-        if "discount_value" not in promo.columns:
-            promo["discount_value"] = 0.0
-        promo["discount_value"] = promo["discount_value"].fillna(0.0).astype(float)
-
-    train["month"] = train["Date"].dt.month
-    train["day"] = train["Date"].dt.day
-    train["weekday"] = train["Date"].dt.weekday
-    train["year"] = train["Date"].dt.year
-
-    base_year = int(train["year"].max()) - 1
-    base_data = train[train["year"].isin([base_year, base_year + 1])].copy()
-
-    base_rev = base_data["Revenue"].mean()
-    base_cogs = base_data["COGS"].mean()
-
-    seasonal = (
-        base_data.groupby(["month", "day"])
-        .agg(rev_norm_season=("Revenue", "mean"), cogs_norm_season=("COGS", "mean"))
-        .reset_index()
-    )
-    seasonal["rev_norm_season"] /= base_rev
-    seasonal["cogs_norm_season"] /= base_cogs
-
-    weekday_prof = (
-        base_data.groupby("weekday")
-        .agg(rev_wday_factor=("Revenue", "mean"), cogs_wday_factor=("COGS", "mean"))
-        .reset_index()
-    )
-    weekday_prof["rev_wday_factor"] /= weekday_prof["rev_wday_factor"].mean()
-    weekday_prof["cogs_wday_factor"] /= weekday_prof["cogs_wday_factor"].mean()
-
-    cal = train.merge(seasonal, on=["month", "day"], how="left").merge(weekday_prof, on="weekday", how="left")
-    cal["rev_norm"] = cal["rev_norm_season"].fillna(1.0)
-    cal["cogs_norm"] = cal["cogs_norm_season"].fillna(1.0)
-    cal["rev_wday_factor"] = cal["rev_wday_factor"].fillna(1.0)
-    cal["cogs_wday_factor"] = cal["cogs_wday_factor"].fillna(1.0)
-    cal["years_ahead"] = cal["year"] - base_year
-
-    val_years = sorted(cal["year"].unique())[-2:]
-    cal_val = cal[cal["year"].isin(val_years)].copy()
-    raw_growth_rev = float(np.clip(cal_val["Revenue"].mean() / (base_rev + 1e-9), 0.5, 2.0))
-    raw_growth_cogs = float(np.clip(cal_val["COGS"].mean() / (base_cogs + 1e-9), 0.5, 2.0))
-
-    split_date = cal["Date"].max() - pd.Timedelta(days=180)
-    cal_val2 = cal[cal["Date"] > split_date].copy()
-
-    best_lam_rev, best_lam_cogs = 1.0, 1.0
-    best_mape_rev, best_mape_cogs = np.inf, np.inf
-    for lam in np.linspace(0.0, 1.0, 11):
-        g_rev = 1.0 + lam * (raw_growth_rev - 1.0)
-        pred_rev = base_rev * (g_rev ** cal_val2["years_ahead"]) * cal_val2["rev_norm"] * cal_val2["rev_wday_factor"]
-        s = mape(cal_val2["Revenue"], pred_rev)
-        if s < best_mape_rev:
-            best_mape_rev = s
-            best_lam_rev = float(lam)
-
-        g_cogs = 1.0 + lam * (raw_growth_cogs - 1.0)
-        pred_cogs = base_cogs * (g_cogs ** cal_val2["years_ahead"]) * cal_val2["cogs_norm"] * cal_val2["cogs_wday_factor"]
-        s = mape(cal_val2["COGS"], pred_cogs)
-        if s < best_mape_cogs:
-            best_mape_cogs = s
-            best_lam_cogs = float(lam)
-
-    growth_rev = 1.0 + best_lam_rev * (raw_growth_rev - 1.0)
-    growth_cogs = 1.0 + best_lam_cogs * (raw_growth_cogs - 1.0)
-
-    cal_base_rev = (base_rev * (growth_rev ** cal["years_ahead"]) * cal["rev_norm"] * cal["rev_wday_factor"]).clip(lower=0).fillna(0)
-    cal_base_cogs = (base_cogs * (growth_cogs ** cal["years_ahead"]) * cal["cogs_norm"] * cal["cogs_wday_factor"]).clip(lower=0).fillna(0)
-
-    def build_promo_daily(promo_df):
-        if promo_df.empty:
-            return pd.DataFrame(columns=["Date", "promo_count", "avg_discount"])
-        chunks = []
-        for _, r in promo_df.iterrows():
-            start, end = r.get("start_date"), r.get("end_date")
-            if pd.isna(start) or pd.isna(end) or end < start:
-                continue
-            days = pd.date_range(start, end, freq="D")
-            chunks.append(pd.DataFrame({
-                "Date": days,
-                "promo_count": 1.0,
-                "discount_value": float(r.get("discount_value", 0.0) or 0.0),
-            }))
-        if not chunks:
-            return pd.DataFrame(columns=["Date", "promo_count", "avg_discount"])
-        return (
-            pd.concat(chunks, ignore_index=True)
-            .groupby("Date", as_index=False)
-            .agg(promo_count=("promo_count", "sum"), avg_discount=("discount_value", "mean"))
-        )
-
-    promo_daily = build_promo_daily(promo)
-
-    TET_DATE = {
-        2013: pd.Timestamp("2013-02-10"), 2014: pd.Timestamp("2014-01-31"),
-        2015: pd.Timestamp("2015-02-19"), 2016: pd.Timestamp("2016-02-08"),
-        2017: pd.Timestamp("2017-01-28"), 2018: pd.Timestamp("2018-02-16"),
-        2019: pd.Timestamp("2019-02-05"), 2020: pd.Timestamp("2020-01-25"),
-        2021: pd.Timestamp("2021-02-12"), 2022: pd.Timestamp("2022-02-01"),
-        2023: pd.Timestamp("2023-01-22"), 2024: pd.Timestamp("2024-02-10"),
-    }
-    fixed_holidays = {(1, 1), (4, 30), (5, 1), (9, 2), (12, 24), (12, 25), (12, 31)}
-
-    def is_tet_period(ts, pre_days=10, post_days=7):
-        tet = TET_DATE.get(ts.year)
-        if tet is None:
-            return False
-        return (tet - pd.Timedelta(days=pre_days)) <= ts <= (tet + pd.Timedelta(days=post_days))
-
-    def add_event_features(df):
-        out = df.merge(promo_daily, on="Date", how="left")
-        out["promo_count"] = out["promo_count"].fillna(0.0)
-        out["avg_discount"] = out["avg_discount"].fillna(0.0)
-        out["is_holiday"] = out["Date"].apply(lambda x: (x.month, x.day) in fixed_holidays)
-        out["is_tet"] = out["Date"].apply(is_tet_period)
-        return out
-
-    cal = add_event_features(cal)
-
-    cal["rev_ratio"] = cal["Revenue"] / cal_base_rev.replace(0, np.nan)
-    cal["cogs_ratio"] = cal["COGS"] / cal_base_cogs.replace(0, np.nan)
-    global_rev_med = cal["rev_ratio"].dropna().median()
-    global_cogs_med = cal["cogs_ratio"].dropna().median()
-    if not np.isfinite(global_rev_med) or global_rev_med <= 0:
-        global_rev_med = 1.0
-    if not np.isfinite(global_cogs_med) or global_cogs_med <= 0:
-        global_cogs_med = 1.0
-
-    def median_ratio(series, mask, global_med):
-        vals = series.loc[mask].dropna()
-        return float(vals.median()) if len(vals) > 0 else float(global_med)
-
-    promo_rev_mult = median_ratio(cal["rev_ratio"], cal["promo_count"] > 0, global_rev_med)
-    promo_cogs_mult = median_ratio(cal["cogs_ratio"], cal["promo_count"] > 0, global_cogs_med)
-    holiday_rev_mult = median_ratio(cal["rev_ratio"], cal["is_holiday"], global_rev_med)
-    holiday_cogs_mult = median_ratio(cal["cogs_ratio"], cal["is_holiday"], global_cogs_med)
-    tet_rev_mult = median_ratio(cal["rev_ratio"], cal["is_tet"], global_rev_med)
-    tet_cogs_mult = median_ratio(cal["cogs_ratio"], cal["is_tet"], global_cogs_med)
-
-    try:
-        from sklearn.linear_model import LinearRegression
-        rev_discount_mask = cal["avg_discount"] > 0
-        if rev_discount_mask.sum() >= 5:
-            lr_rev = LinearRegression()
-            lr_rev.fit(cal.loc[rev_discount_mask, ["avg_discount"]], np.log(cal.loc[rev_discount_mask, "rev_ratio"].clip(lower=0.1)))
-            rev_discount_coef = float(np.clip(lr_rev.coef_[0], -0.5, 0.5))
-        else:
-            rev_discount_coef = 0.0
-        cogs_discount_mask = cal["avg_discount"] > 0
-        if cogs_discount_mask.sum() >= 5:
-            lr_cogs = LinearRegression()
-            lr_cogs.fit(cal.loc[cogs_discount_mask, ["avg_discount"]], np.log(cal.loc[cogs_discount_mask, "cogs_ratio"].clip(lower=0.1)))
-            cogs_discount_coef = float(np.clip(lr_cogs.coef_[0], -0.5, 0.5))
-        else:
-            cogs_discount_coef = 0.0
-    except Exception:
-        rev_discount_coef = 0.0
-        cogs_discount_coef = 0.0
-
-    def event_multiplier(df, promo_mult, holiday_mult, tet_mult, discount_coef):
-        mult = np.ones(len(df), dtype=float)
-        mult *= np.where(df["promo_count"] > 0, promo_mult, 1.0)
-        mult *= np.where(df["is_holiday"], holiday_mult, 1.0)
-        mult *= np.where(df["is_tet"], tet_mult, 1.0)
-        mult *= (1.0 + discount_coef * df["avg_discount"])
-        return np.clip(mult, 0.7, 1.6)
-
-    cal_rev_event = event_multiplier(cal, promo_rev_mult, holiday_rev_mult, tet_rev_mult, rev_discount_coef)
-    cal_cogs_event = event_multiplier(cal, promo_cogs_mult, holiday_cogs_mult, tet_cogs_mult, cogs_discount_coef)
-
-    cal["Revenue_pred"] = (cal_base_rev * cal_rev_event).clip(lower=0)
-    cal["COGS_pred"] = (cal_base_cogs * cal_cogs_event).clip(lower=0)
-    cal["COGS_pred"] = np.minimum(cal["COGS_pred"], cal["Revenue_pred"] * 0.995)
-
-    test["month"] = test["Date"].dt.month
-    test["day"] = test["Date"].dt.day
-    test["weekday"] = test["Date"].dt.weekday
-    test["year"] = test["Date"].dt.year
-    model_test = test.merge(seasonal, on=["month", "day"], how="left").merge(weekday_prof, on="weekday", how="left")
-    model_test["rev_norm"] = model_test["rev_norm_season"].fillna(1.0)
-    model_test["cogs_norm"] = model_test["cogs_norm_season"].fillna(1.0)
-    model_test["rev_wday_factor"] = model_test["rev_wday_factor"].fillna(1.0)
-    model_test["cogs_wday_factor"] = model_test["cogs_wday_factor"].fillna(1.0)
-    model_test["years_ahead"] = model_test["year"] - base_year
-
-    test_base_rev = (base_rev * (growth_rev ** model_test["years_ahead"]) * model_test["rev_norm"] * model_test["rev_wday_factor"]).fillna(0)
-    test_base_cogs = (base_cogs * (growth_cogs ** model_test["years_ahead"]) * model_test["cogs_norm"] * model_test["cogs_wday_factor"]).fillna(0)
-    model_test = add_event_features(model_test)
-    test_rev_event = event_multiplier(model_test, promo_rev_mult, holiday_rev_mult, tet_rev_mult, rev_discount_coef)
-    test_cogs_event = event_multiplier(model_test, promo_cogs_mult, holiday_cogs_mult, tet_cogs_mult, cogs_discount_coef)
-    model_test["Revenue_pred"] = (test_base_rev * test_rev_event).clip(lower=0).round(2)
-    model_test["COGS_pred"] = (test_base_cogs * test_cogs_event).clip(lower=0).round(2)
-    model_test["COGS_pred"] = np.minimum(model_test["COGS_pred"], model_test["Revenue_pred"] * 0.995)
-
-    train_pred = cal[["Date", "Revenue_pred", "COGS_pred"]].copy()
-    test_pred = model_test[["Date", "Revenue_pred", "COGS_pred"]].copy()
-    return train_pred, test_pred
-
-
-# ---------------------------------------------------------------------------
-# 3. Time-Series Cross Validation
+# 3. Time-Series Cross Validation (RF + LGB + XGB only)
 # ---------------------------------------------------------------------------
 def run_tscv(
     train,
     test_feat,
-    baseline_train_pred,
-    baseline_test_pred,
     n_splits=5,
 ):
     dates = train["Date"].reset_index(drop=True)
@@ -348,22 +138,14 @@ def run_tscv(
         "rf_rev": np.zeros(n_train), "rf_cogs": np.zeros(n_train),
         "lgb_rev": np.zeros(n_train), "lgb_cogs": np.zeros(n_train),
         "xgb_rev": np.zeros(n_train), "xgb_cogs": np.zeros(n_train),
-        "resid_rev": np.zeros(n_train), "resid_cogs": np.zeros(n_train),
     }
     test_fold = {
         "rf_rev": [], "rf_cogs": [],
         "lgb_rev": [], "lgb_cogs": [],
         "xgb_rev": [], "xgb_cogs": [],
-        "resid_rev": [], "resid_cogs": [],
     }
 
-    # collect per-fold metrics
     fold_records = []
-
-    base_rev_train = baseline_train_pred["Revenue_pred"].to_numpy()
-    base_cogs_train = baseline_train_pred["COGS_pred"].to_numpy()
-    base_rev_test = baseline_test_pred["Revenue_pred"].to_numpy()
-    base_cogs_test = baseline_test_pred["COGS_pred"].to_numpy()
 
     test_X = test_feat.drop(columns=["Date"], errors="ignore").copy()
     test_X = test_X.reindex(columns=feature_names)
@@ -377,15 +159,10 @@ def run_tscv(
         y_tr, y_va = y.iloc[tr_idx], y.iloc[val_idx]
         yl_tr, yl_va = y_log.iloc[tr_idx], y_log.iloc[val_idx]
 
-        base_rev_tr = base_rev_train[tr_idx]
-        base_cogs_tr = base_cogs_train[tr_idx]
-        base_rev_va = base_rev_train[val_idx]
-        base_cogs_va = base_cogs_train[val_idx]
-
         # ---- Random Forest ----
         rf = RandomForestRegressor(
-            n_estimators=300, max_depth=12, min_samples_split=5,
-            min_samples_leaf=2, n_jobs=-1, random_state=42,
+            n_estimators=200, max_depth=8, min_samples_split=10,
+            min_samples_leaf=5, max_features="sqrt", n_jobs=-1, random_state=42,
         )
         rf.fit(X_tr, yl_tr)
         p = rf.predict(X_va)
@@ -411,7 +188,8 @@ def run_tscv(
         dval = lgb.Dataset(X_va, label=yl_va["Revenue"], reference=dtrain)
         lgb_rev = lgb.train(
             {"objective": "regression", "metric": "mape", "verbosity": -1,
-             "learning_rate": 0.05, "num_leaves": 31, "max_depth": 8,
+             "learning_rate": 0.03, "num_leaves": 20, "max_depth": 6,
+             "min_child_samples": 20,
              "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 5},
             dtrain, num_boost_round=2000, valid_sets=[dval],
             callbacks=[lgb.early_stopping(50, verbose=False)],
@@ -426,7 +204,8 @@ def run_tscv(
         dval = lgb.Dataset(X_va, label=yl_va["COGS"], reference=dtrain)
         lgb_cogs = lgb.train(
             {"objective": "regression", "metric": "mape", "verbosity": -1,
-             "learning_rate": 0.05, "num_leaves": 31, "max_depth": 8,
+             "learning_rate": 0.03, "num_leaves": 20, "max_depth": 6,
+             "min_child_samples": 20,
              "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 5},
             dtrain, num_boost_round=2000, valid_sets=[dval],
             callbacks=[lgb.early_stopping(50, verbose=False)],
@@ -446,8 +225,9 @@ def run_tscv(
         dval = xgb.DMatrix(X_va, label=yl_va["Revenue"])
         xgb_rev = xgb.train(
             {"objective": "reg:squarederror", "eval_metric": "mape", "seed": 42,
-             "learning_rate": 0.05, "max_depth": 6, "subsample": 0.8,
-             "colsample_bytree": 0.8, "nthread": -1},
+             "learning_rate": 0.03, "max_depth": 4, "subsample": 0.8,
+             "colsample_bytree": 0.8, "min_child_weight": 3, "reg_lambda": 1.0,
+             "nthread": -1},
             dtrain, num_boost_round=800, evals=[(dval, "val")],
             early_stopping_rounds=50, verbose_eval=False,
         )
@@ -461,8 +241,9 @@ def run_tscv(
         dval = xgb.DMatrix(X_va, label=yl_va["COGS"])
         xgb_cogs = xgb.train(
             {"objective": "reg:squarederror", "eval_metric": "mape", "seed": 42,
-             "learning_rate": 0.05, "max_depth": 6, "subsample": 0.8,
-             "colsample_bytree": 0.8, "nthread": -1},
+             "learning_rate": 0.03, "max_depth": 4, "subsample": 0.8,
+             "colsample_bytree": 0.8, "min_child_weight": 3, "reg_lambda": 1.0,
+             "nthread": -1},
             dtrain, num_boost_round=800, evals=[(dval, "val")],
             early_stopping_rounds=50, verbose_eval=False,
         )
@@ -476,93 +257,82 @@ def run_tscv(
                              "mape": mape(y_va["COGS"], pr_cogs), "r2": r2_score_fn(y_va["COGS"], pr_cogs)})
         print(f"  XGB  MAPE Rev: {mape(y_va['Revenue'], pr_rev):.4f}  COGS: {mape(y_va['COGS'], pr_cogs):.4f} | R2 Rev: {r2_score_fn(y_va['Revenue'], pr_rev):.4f}  COGS: {r2_score_fn(y_va['COGS'], pr_cogs):.4f}")
 
-        # ---- Residual ElasticNet ----
-        resid_rev_train = yl_tr["Revenue"].to_numpy() - np.log1p(base_rev_tr)
-        resid_cogs_train = yl_tr["COGS"].to_numpy() - np.log1p(base_cogs_tr)
-        resid_rev_val_true = yl_va["Revenue"].to_numpy() - np.log1p(base_rev_va)
-        resid_cogs_val_true = yl_va["COGS"].to_numpy() - np.log1p(base_cogs_va)
-
-        en_rev = Pipeline([
-            ("scaler", StandardScaler()),
-            ("en", ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=5000)),
-        ])
-        en_cogs = Pipeline([
-            ("scaler", StandardScaler()),
-            ("en", ElasticNet(alpha=0.001, l1_ratio=0.8, max_iter=5000)),
-        ])
-        en_rev.fit(X_tr, resid_rev_train)
-        en_cogs.fit(X_tr, resid_cogs_train)
-
-        resid_rev_pred = en_rev.predict(X_va)
-        resid_cogs_pred = en_cogs.predict(X_va)
-        pr_rev = np.maximum(safe_expm1(np.log1p(base_rev_va) + resid_rev_pred), 0.0)
-        pr_cogs = np.maximum(safe_expm1(np.log1p(base_cogs_va) + resid_cogs_pred), 0.0)
-        oof["resid_rev"][val_idx] = pr_rev
-        oof["resid_cogs"][val_idx] = pr_cogs
-
-        resid_rev_test = en_rev.predict(test_X)
-        resid_cogs_test = en_cogs.predict(test_X)
-        pt_rev = np.maximum(safe_expm1(np.log1p(base_rev_test) + resid_rev_test), 0.0)
-        pt_cogs = np.maximum(safe_expm1(np.log1p(base_cogs_test) + resid_cogs_test), 0.0)
-        test_fold["resid_rev"].append(pt_rev)
-        test_fold["resid_cogs"].append(pt_cogs)
-        fold_records.append({"fold": fold, "model": "resid_en", "target": "Revenue",
-                             "mape": mape(y_va["Revenue"], pr_rev), "r2": r2_score_fn(y_va["Revenue"], pr_rev)})
-        fold_records.append({"fold": fold, "model": "resid_en", "target": "COGS",
-                             "mape": mape(y_va["COGS"], pr_cogs), "r2": r2_score_fn(y_va["COGS"], pr_cogs)})
-        print(f"  ResEN MAPE Rev: {mape(y_va['Revenue'], pr_rev):.4f}  COGS: {mape(y_va['COGS'], pr_cogs):.4f} | R2 Rev: {r2_score_fn(y_va['Revenue'], pr_rev):.4f}  COGS: {r2_score_fn(y_va['COGS'], pr_cogs):.4f}")
-
     # Average test predictions across folds
     test_avg = {}
     for k, v in test_fold.items():
         test_avg[k] = np.mean(np.vstack(v), axis=0)
 
     fold_df = pd.DataFrame(fold_records)
-    return oof, test_avg, y, fold_df, dates
+    
+    # Store fold boundaries for plotting
+    fold_boundaries = []
+    tscv_for_boundaries = TimeSeriesSplit(n_splits=n_splits)
+    for fold, (tr_idx, val_idx) in enumerate(tscv_for_boundaries.split(X), 1):
+        fold_boundaries.append({
+            "fold": fold,
+            "train_start": dates.iloc[tr_idx[0]],
+            "train_end": dates.iloc[tr_idx[-1]],
+            "val_start": dates.iloc[val_idx[0]],
+            "val_end": dates.iloc[val_idx[-1]],
+        })
+    
+    return oof, test_avg, y, fold_df, dates, fold_boundaries
 
 
 # ---------------------------------------------------------------------------
-# 4. Stacking with Huber Regression
+# 4. Stacking with multiple meta-learners
 # ---------------------------------------------------------------------------
-def stack_with_huber(oof, test_avg, y_train, test_dates):
-    X_stack_rev = np.column_stack([
-        oof["rf_rev"], oof["lgb_rev"], oof["xgb_rev"],
-        oof["resid_rev"],
-    ])
-    X_stack_cogs = np.column_stack([
-        oof["rf_cogs"], oof["lgb_cogs"], oof["xgb_cogs"],
-        oof["resid_cogs"],
-    ])
+META_LEARNERS = {
+    "huber": HuberRegressor(epsilon=1.35, max_iter=2000),
+    "ridge": Ridge(alpha=1.0),
+    "lasso": Lasso(alpha=1.0, max_iter=5000),
+    "elasticnet": ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=5000),
+    "bayesian_ridge": BayesianRidge(),
+    "gbm": GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
+}
 
-    X_test_rev = np.column_stack([
-        test_avg["rf_rev"], test_avg["lgb_rev"], test_avg["xgb_rev"],
-        test_avg["resid_rev"],
-    ])
-    X_test_cogs = np.column_stack([
-        test_avg["rf_cogs"], test_avg["lgb_cogs"], test_avg["xgb_cogs"],
-        test_avg["resid_cogs"],
-    ])
 
-    huber_rev = HuberRegressor(epsilon=1.35, max_iter=1000)
-    huber_rev.fit(X_stack_rev, y_train["Revenue"].to_numpy())
-    pred_rev = huber_rev.predict(X_test_rev)
+def build_stack_features(oof, test_avg):
+    """Build feature matrices for stacking from 3 tree models."""
+    X_stack_rev = np.column_stack([oof["rf_rev"], oof["lgb_rev"], oof["xgb_rev"]])
+    X_stack_cogs = np.column_stack([oof["rf_cogs"], oof["lgb_cogs"], oof["xgb_cogs"]])
+    X_test_rev = np.column_stack([test_avg["rf_rev"], test_avg["lgb_rev"], test_avg["xgb_rev"]])
+    X_test_cogs = np.column_stack([test_avg["rf_cogs"], test_avg["lgb_cogs"], test_avg["xgb_cogs"]])
+    return X_stack_rev, X_stack_cogs, X_test_rev, X_test_cogs
 
-    huber_cogs = HuberRegressor(epsilon=1.35, max_iter=1000)
-    huber_cogs.fit(X_stack_cogs, y_train["COGS"].to_numpy())
-    pred_cogs = huber_cogs.predict(X_test_cogs)
+
+def stack_models(oof, test_avg, y_train, test_dates, meta_name="huber"):
+    """Fit chosen meta-learner on 4 tree model OOF predictions."""
+    meta = META_LEARNERS.get(meta_name)
+    if meta is None:
+        raise ValueError(f"Unknown meta-learner: {meta_name}. Choose from {list(META_LEARNERS.keys())}")
+
+    X_stack_rev, X_stack_cogs, X_test_rev, X_test_cogs = build_stack_features(oof, test_avg)
+
+    meta_rev = meta.__class__(**meta.get_params())
+    meta_cogs = meta.__class__(**meta.get_params())
+    meta_rev.fit(X_stack_rev, y_train["Revenue"].to_numpy())
+    meta_cogs.fit(X_stack_cogs, y_train["COGS"].to_numpy())
+    pred_rev = meta_rev.predict(X_test_rev)
+    pred_cogs = meta_cogs.predict(X_test_cogs)
 
     pred_rev = np.maximum(pred_rev, 0.0)
     pred_cogs = np.maximum(pred_cogs, 0.0)
     pred_cogs = np.minimum(pred_cogs, pred_rev * 0.995)
 
-    # OOF stacking predictions
-    stack_rev_train = huber_rev.predict(X_stack_rev)
-    stack_cogs_train = huber_cogs.predict(X_stack_cogs)
+    stack_rev_train = meta_rev.predict(X_stack_rev)
+    stack_cogs_train = meta_cogs.predict(X_stack_cogs)
 
-    print("\nHuber stacking weights (Revenue):", dict(zip(["rf", "lgb", "xgb", "resid_en"], huber_rev.coef_.round(4))))
-    print("Huber stacking intercept (Revenue):", round(huber_rev.intercept_, 2))
-    print("Huber stacking weights (COGS):", dict(zip(["rf", "lgb", "xgb", "resid_en"], huber_cogs.coef_.round(4))))
-    print("Huber stacking intercept (COGS):", round(huber_cogs.intercept_, 2))
+    print(f"\n=== Stacking 3 models: {meta_name.upper()} ===")
+    model_names = ['rf', 'lgb', 'xgb']
+    if hasattr(meta_rev, "coef_"):
+        print(f"Weights (Revenue): {dict(zip(model_names, np.round(meta_rev.coef_, 4)))}")
+        print(f"Intercept (Revenue): {round(meta_rev.intercept_, 2) if hasattr(meta_rev, 'intercept_') else 'N/A'}")
+        print(f"Weights (COGS):    {dict(zip(model_names, np.round(meta_cogs.coef_, 4)))}")
+        print(f"Intercept (COGS): {round(meta_cogs.intercept_, 2) if hasattr(meta_cogs, 'intercept_') else 'N/A'}")
+    elif hasattr(meta_rev, "feature_importances_"):
+        print(f"Feature importances (Revenue): {dict(zip(model_names, np.round(meta_rev.feature_importances_, 4)))}")
+        print(f"Feature importances (COGS):    {dict(zip(model_names, np.round(meta_cogs.feature_importances_, 4)))}")
 
     sub = pd.DataFrame({
         "Date": pd.to_datetime(test_dates).dt.strftime("%Y-%m-%d"),
@@ -572,38 +342,148 @@ def stack_with_huber(oof, test_avg, y_train, test_dates):
     return sub, stack_rev_train, stack_cogs_train
 
 
+def stack_with_residual(oof, test_avg, y_train, test_dates, X_train_raw, X_test_raw, meta_name="huber"):
+    """
+    Stack 3 models, then fit ElasticNet on residual of stacking output.
+    Returns final prediction = stacking_pred + ResEN_residual.
+    """
+    # Step 1: Stack 3 models
+    meta = META_LEARNERS.get(meta_name)
+    X_stack_rev, X_stack_cogs, X_test_rev, X_test_cogs = build_stack_features(oof, test_avg)
+
+    meta_rev = meta.__class__(**meta.get_params())
+    meta_cogs = meta.__class__(**meta.get_params())
+    meta_rev.fit(X_stack_rev, y_train["Revenue"].to_numpy())
+    meta_cogs.fit(X_stack_cogs, y_train["COGS"].to_numpy())
+
+    stack_rev_pred = meta_rev.predict(X_stack_rev)
+    stack_cogs_pred = meta_cogs.predict(X_stack_cogs)
+    stack_test_rev = meta_rev.predict(X_test_rev)
+    stack_test_cogs = meta_cogs.predict(X_test_cogs)
+
+    # Step 2: Residual = actual_log - log1p(stacking_pred)
+    resid_rev = np.log1p(y_train["Revenue"].to_numpy()) - np.log1p(np.maximum(stack_rev_pred, 0.0))
+    resid_cogs = np.log1p(y_train["COGS"].to_numpy()) - np.log1p(np.maximum(stack_cogs_pred, 0.0))
+
+    # Step 3: Fit ElasticNet on residual
+    en_rev = Pipeline([
+        ("scaler", StandardScaler()),
+        ("en", ElasticNet(alpha=0.1, l1_ratio=0.5, max_iter=5000)),
+    ])
+    en_cogs = Pipeline([
+        ("scaler", StandardScaler()),
+        ("en", ElasticNet(alpha=0.001, l1_ratio=0.8, max_iter=5000)),
+    ])
+    en_rev.fit(X_train_raw, resid_rev)
+    en_cogs.fit(X_train_raw, resid_cogs)
+
+    # Step 4: Final prediction = expm1(log1p(stacking) + EN_residual)
+    resid_rev_test = en_rev.predict(X_test_raw)
+    resid_cogs_test = en_cogs.predict(X_test_raw)
+    final_rev = np.maximum(safe_expm1(np.log1p(np.maximum(stack_test_rev, 0.0)) + resid_rev_test), 0.0)
+    final_cogs = np.maximum(safe_expm1(np.log1p(np.maximum(stack_test_cogs, 0.0)) + resid_cogs_test), 0.0)
+    final_cogs = np.minimum(final_cogs, final_rev * 0.995)
+
+    # OOF final predictions
+    resid_rev_oof = en_rev.predict(X_train_raw)
+    resid_cogs_oof = en_cogs.predict(X_train_raw)
+    final_rev_oof = np.maximum(safe_expm1(np.log1p(np.maximum(stack_rev_pred, 0.0)) + resid_rev_oof), 0.0)
+    final_cogs_oof = np.maximum(safe_expm1(np.log1p(np.maximum(stack_cogs_pred, 0.0)) + resid_cogs_oof), 0.0)
+
+    print(f"\n=== Stacking 3 models + ResEN residual: {meta_name.upper()} ===")
+    print(f"Stacking-only MAPE Rev: {mape(y_train['Revenue'], stack_rev_pred):.4f}  COGS: {mape(y_train['COGS'], stack_cogs_pred):.4f}")
+    print(f"Stacking+ResEN MAPE Rev: {mape(y_train['Revenue'], final_rev_oof):.4f}  COGS: {mape(y_train['COGS'], final_cogs_oof):.4f}")
+
+    sub = pd.DataFrame({
+        "Date": pd.to_datetime(test_dates).dt.strftime("%Y-%m-%d"),
+        "Revenue": np.round(final_rev, 2),
+        "COGS": np.round(final_cogs, 2),
+    })
+    return sub, final_rev_oof, final_cogs_oof
+
+
+def compare_stackers(oof, y_train):
+    """Compare all meta-learners on OOF (3 models only) and return best."""
+    results = []
+    best_mape = np.inf
+    best_name = None
+
+    X_stack_rev, X_stack_cogs, _, _ = build_stack_features(oof, oof)
+
+    for name, meta in META_LEARNERS.items():
+        meta_rev = meta.__class__(**meta.get_params())
+        meta_cogs = meta.__class__(**meta.get_params())
+        meta_rev.fit(X_stack_rev, y_train["Revenue"].to_numpy())
+        meta_cogs.fit(X_stack_cogs, y_train["COGS"].to_numpy())
+
+        pred_rev = meta_rev.predict(X_stack_rev)
+        pred_cogs = meta_cogs.predict(X_stack_cogs)
+        pred_rev = np.maximum(pred_rev, 0.0)
+        pred_cogs = np.maximum(pred_cogs, 0.0)
+        pred_cogs = np.minimum(pred_cogs, pred_rev * 0.995)
+
+        mape_rev = mape(y_train["Revenue"], pred_rev)
+        mape_cogs = mape(y_train["COGS"], pred_cogs)
+        avg_mape = (mape_rev + mape_cogs) / 2
+
+        results.append({
+            "meta_learner": name,
+            "mape_revenue": mape_rev,
+            "mape_cogs": mape_cogs,
+            "avg_mape": avg_mape,
+            "r2_revenue": r2_score_fn(y_train["Revenue"], pred_rev),
+            "r2_cogs": r2_score_fn(y_train["COGS"], pred_cogs),
+        })
+
+        if avg_mape < best_mape:
+            best_mape = avg_mape
+            best_name = name
+
+    results_df = pd.DataFrame(results).sort_values("avg_mape")
+    print("\n=== Meta-Learner Comparison (OOF) ===")
+    print(results_df.to_string(index=False))
+    print(f"\nBest meta-learner: {best_name} (avg MAPE: {best_mape:.4f})")
+    return best_name, results_df
+
+
 # ---------------------------------------------------------------------------
 # 5. Plots
 # ---------------------------------------------------------------------------
-def plot_results(dates, y, oof, stack_rev_train, stack_cogs_train, fold_df, out_dir):
+def plot_results(dates, y, oof, stack_rev_train, stack_cogs_train, fold_df, fold_boundaries, out_dir):
     """
-    Generate and save diagnostic plots:
-      1. OOF time-series: Actual vs each model (Revenue & COGS)
-      2. Scatter actual vs predicted (Stacking)
-      3. Bar chart: CV MAPE and R2 mean±std by model
+    Generate and save diagnostic plots.
     """
     dates = pd.to_datetime(dates)
+    n_splits = len(fold_boundaries)
 
-    # ---------- Plot 1: OOF Time Series ----------
-    fig, axes = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
-    models_rev = [("rf_rev", "RF"), ("lgb_rev", "LGB"), ("xgb_rev", "XGB"), ("resid_rev", "ResEN")]
-    models_cogs = [("rf_cogs", "RF"), ("lgb_cogs", "LGB"), ("xgb_cogs", "XGB"), ("resid_cogs", "ResEN")]
+    # ---------- Plot 1: OOF Time Series with fold boundaries ----------
+    fig, axes = plt.subplots(2, 1, figsize=(16, 10), sharex=True)
+    models_rev = [("rf_rev", "RF"), ("lgb_rev", "LGB"), ("xgb_rev", "XGB")]
+    models_cogs = [("rf_cogs", "RF"), ("lgb_cogs", "LGB"), ("xgb_cogs", "XGB")]
 
-    axes[0].plot(dates, y["Revenue"], label="Actual", color="black", lw=1.2)
+    colors_fold = plt.cm.Set1(np.linspace(0, 1, n_splits))
+
+    axes[0].plot(dates, y["Revenue"], label="Actual", color="black", lw=1.5, zorder=5)
     for key, label in models_rev:
-        axes[0].plot(dates, oof[key], label=label, lw=0.8, linestyle="--", alpha=0.8)
-    axes[0].set_title("Revenue — OOF Predictions (5-fold TimeSeriesCV)")
+        axes[0].plot(dates, oof[key], label=label, lw=0.8, linestyle="--", alpha=0.6)
+    for i, fb in enumerate(fold_boundaries):
+        axes[0].axvline(x=fb["val_start"], color=colors_fold[i], linestyle=":", alpha=0.7, lw=1.5)
+        axes[0].axvspan(fb["val_start"], fb["val_end"], alpha=0.1, color=colors_fold[i])
+    axes[0].set_title("Revenue — OOF Predictions with CV Folds")
     axes[0].set_ylabel("Revenue")
-    axes[0].legend(loc="upper left", fontsize=8)
+    axes[0].legend(loc="upper left", fontsize=7, ncol=2)
     axes[0].grid(alpha=0.3)
 
-    axes[1].plot(dates, y["COGS"], label="Actual", color="black", lw=1.2)
+    axes[1].plot(dates, y["COGS"], label="Actual", color="black", lw=1.5, zorder=5)
     for key, label in models_cogs:
-        axes[1].plot(dates, oof[key], label=label, lw=0.8, linestyle="--", alpha=0.8)
-    axes[1].set_title("COGS — OOF Predictions (5-fold TimeSeriesCV)")
+        axes[1].plot(dates, oof[key], label=label, lw=0.8, linestyle="--", alpha=0.6)
+    for i, fb in enumerate(fold_boundaries):
+        axes[1].axvline(x=fb["val_start"], color=colors_fold[i], linestyle=":", alpha=0.7, lw=1.5)
+        axes[1].axvspan(fb["val_start"], fb["val_end"], alpha=0.1, color=colors_fold[i])
+    axes[1].set_title("COGS — OOF Predictions with CV Folds")
     axes[1].set_ylabel("COGS")
     axes[1].set_xlabel("Date")
-    axes[1].legend(loc="upper left", fontsize=8)
+    axes[1].legend(loc="upper left", fontsize=7, ncol=2)
     axes[1].grid(alpha=0.3)
 
     plt.tight_layout()
@@ -660,6 +540,59 @@ def plot_results(dates, y, oof, stack_rev_train, stack_cogs_train, fold_df, out_
     plt.close(fig)
     print(f"Saved plot: {out_dir / 'plot_cv_metrics.png'}")
 
+    # ---------- Plot 4: Per-fold scatter Revenue & COGS ----------
+    for target, tname, y_actual in [("rev", "Revenue", y["Revenue"]), ("cogs", "COGS", y["COGS"])]:
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes = axes.flatten()
+        models = [("rf", "RF"), ("lgb", "LGB"), ("xgb", "XGB")]
+        
+        for i, (model_key, model_label) in enumerate(models):
+            ax = axes[i]
+            oof_key = f"{model_key}_{target}"
+            
+            for fold_num, fb in enumerate(fold_boundaries, 1):
+                mask = (dates >= fb["val_start"]) & (dates <= fb["val_end"])
+                if mask.sum() > 0:
+                    fold_actual = y_actual[mask]
+                    fold_pred = pd.Series(oof[oof_key])[mask]
+                    fold_mape = mape(fold_actual, fold_pred)
+                    fold_r2 = r2_score_fn(fold_actual, fold_pred)
+                    ax.scatter(fold_actual, fold_pred, alpha=0.5, s=20, 
+                              label=f"Fold {fold_num} (MAPE:{fold_mape:.3f}, R2:{fold_r2:.2f})")
+            
+            max_val = max(y_actual.max(), pd.Series(oof[oof_key]).max())
+            ax.plot([0, max_val], [0, max_val], "k--", lw=1, alpha=0.5)
+            ax.set_xlabel(f"Actual {tname}")
+            ax.set_ylabel(f"Predicted {tname}")
+            ax.set_title(f"{model_label} — {tname}")
+            ax.legend(loc="upper left", fontsize=7)
+            ax.grid(alpha=0.3)
+        
+        ax = axes[5]
+        stack_pred = stack_rev_train if target == "rev" else stack_cogs_train
+        for fold_num, fb in enumerate(fold_boundaries, 1):
+            mask = (dates >= fb["val_start"]) & (dates <= fb["val_end"])
+            if mask.sum() > 0:
+                fold_actual = y_actual[mask]
+                fold_pred = pd.Series(stack_pred)[mask]
+                fold_mape = mape(fold_actual, fold_pred)
+                fold_r2 = r2_score_fn(fold_actual, fold_pred)
+                ax.scatter(fold_actual, fold_pred, alpha=0.5, s=20,
+                          label=f"Fold {fold_num} (MAPE:{fold_mape:.3f}, R2:{fold_r2:.2f})")
+        max_val = max(y_actual.max(), pd.Series(stack_pred).max())
+        ax.plot([0, max_val], [0, max_val], "k--", lw=1, alpha=0.5)
+        ax.set_xlabel(f"Actual {tname}")
+        ax.set_ylabel(f"Predicted {tname}")
+        ax.set_title(f"Stacking — {tname}")
+        ax.legend(loc="upper left", fontsize=7)
+        ax.grid(alpha=0.3)
+        
+        plt.suptitle(f"Per-fold Actual vs Predicted — {tname}", fontsize=14, y=1.00)
+        plt.tight_layout()
+        fig.savefig(out_dir / f"plot_fold_scatter_{target}.png", dpi=200)
+        plt.close(fig)
+        print(f"Saved plot: {out_dir / f'plot_fold_scatter_{target}.png'}")
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -668,36 +601,63 @@ def main():
     print("Loading processed features...")
     train, test_feat = load_processed_features()
 
-    print("Building Baseline+ predictions...")
-    baseline_train_pred, baseline_test_pred = build_baseline_plus(train, test_feat)
-
     print(f"Train rows: {len(train)} | Test rows: {len(test_feat)}")
 
-    print("\nRunning 5-fold TimeSeriesCV...")
-    oof, test_avg, y, fold_df, dates = run_tscv(
-        train, test_feat, baseline_train_pred, baseline_test_pred, n_splits=5
+    print("\nRunning TimeSeriesCV...")
+    oof, test_avg, y, fold_df, dates, fold_boundaries = run_tscv(
+        train, test_feat, n_splits=5
     )
 
     print("\n=== OOF CV Scores ===")
     for target in ["rev", "cogs"]:
         tname = "Revenue" if target == "rev" else "COGS"
-        for model in ["rf", "lgb", "xgb", "resid"]:
+        for model in ["rf", "lgb", "xgb"]:
             key = f"{model}_{target}"
             print(f"  {key.upper():12s} MAPE: {mape(y[tname], oof[key]):.4f} | R2: {r2_score_fn(y[tname], oof[key]):.4f}")
 
-    print("\nStacking with Huber Regression...")
-    submission, stack_rev_train, stack_cogs_train = stack_with_huber(oof, test_avg, y, test_feat["Date"])
+    # Prepare raw features for residual model
+    feature_cols = [c for c in train.columns if c not in ["Date", "Revenue", "COGS"]]
+    X_train_raw = train[feature_cols].copy()
+    X_test_raw = test_feat[feature_cols].copy()
+    median_vals = X_train_raw.median(numeric_only=True)
+    X_train_raw = X_train_raw.fillna(median_vals).fillna(0.0).to_numpy()
+    X_test_raw = X_test_raw.fillna(median_vals).fillna(0.0).to_numpy()
 
-    print(f"\nStacking OOF — Revenue MAPE: {mape(y['Revenue'], stack_rev_train):.4f} | R2: {r2_score_fn(y['Revenue'], stack_rev_train):.4f}")
-    print(f"Stacking OOF — COGS   MAPE: {mape(y['COGS'], stack_cogs_train):.4f} | R2: {r2_score_fn(y['COGS'], stack_cogs_train):.4f}")
+    # === Chosen meta-learner: GBM ===
+    meta_name = "gbm"
+    print(f"\n=== Stacking 3 models with meta-learner: {meta_name.upper()} ===")
 
-    out_path = OUT_DIR / "stacking_huber_tscv_submission.csv"
-    submission.to_csv(out_path, index=False)
-    print(f"\nSaved submission: {out_path}")
-    print(submission.head(10))
+    # Stacking 3 models only
+    submission3, stack3_rev, stack3_cogs = stack_models(
+        oof, test_avg, y, test_feat["Date"], meta_name=meta_name
+    )
+    out_path3 = OUT_DIR / f"stacking3_{meta_name}_tscv_submission.csv"
+    submission3.to_csv(out_path3, index=False)
+    print(f"Saved: {out_path3}")
+    print(f"Stacking3 OOF — Revenue MAPE: {mape(y['Revenue'], stack3_rev):.4f} | R2: {r2_score_fn(y['Revenue'], stack3_rev):.4f}")
+    print(f"Stacking3 OOF — COGS   MAPE: {mape(y['COGS'], stack3_cogs):.4f} | R2: {r2_score_fn(y['COGS'], stack3_cogs):.4f}")
+
+    # Stacking 3 models + ResEN
+    sub_res, stack_res_rev, stack_res_cogs = stack_with_residual(
+        oof, test_avg, y, test_feat["Date"], X_train_raw, X_test_raw, meta_name=meta_name
+    )
+    out_path_res = OUT_DIR / f"stacking3_{meta_name}_resen_tscv_submission.csv"
+    sub_res.to_csv(out_path_res, index=False)
+    print(f"Saved: {out_path_res}")
+    print(f"Stacking3+ResEN OOF — Revenue MAPE: {mape(y['Revenue'], stack_res_rev):.4f} | R2: {r2_score_fn(y['Revenue'], stack_res_rev):.4f}")
+    print(f"Stacking3+ResEN OOF — COGS   MAPE: {mape(y['COGS'], stack_res_cogs):.4f} | R2: {r2_score_fn(y['COGS'], stack_res_cogs):.4f}")
+
+    # Pick best variant for plotting
+    if mape(y["Revenue"], stack_res_rev) + mape(y["COGS"], stack_res_cogs) < \
+       mape(y["Revenue"], stack3_rev) + mape(y["COGS"], stack3_cogs):
+        best_stack_rev = stack_res_rev
+        best_stack_cogs = stack_res_cogs
+    else:
+        best_stack_rev = stack3_rev
+        best_stack_cogs = stack3_cogs
 
     print("\nGenerating plots...")
-    plot_results(dates, y, oof, stack_rev_train, stack_cogs_train, fold_df, OUT_DIR)
+    plot_results(dates, y, oof, best_stack_rev, best_stack_cogs, fold_df, fold_boundaries, OUT_DIR)
 
 
 if __name__ == "__main__":
